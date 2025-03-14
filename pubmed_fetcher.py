@@ -1,6 +1,8 @@
 import requests
 import csv
 from typing import List, Dict, Optional
+from lxml import etree
+import time
 
 class PubMedFetcher:
     """A class to fetch and filter research papers from PubMed."""
@@ -13,29 +15,47 @@ class PubMedFetcher:
         self.debug = debug
 
     def fetch_papers(self) -> List[Dict]:
-        """Fetch papers from PubMed based on the query."""
+        """Fetch 5 papers from PubMed based on the query."""
         search_params = {
             "db": "pubmed",
             "term": self.query,
             "retmode": "json",
-            "retmax": 1000,  # Adjust as needed
+            "retmax": 10,  # Fetch 5 papers instead of 1
         }
         if self.debug:
-            print(f"Fetching papers for query: {self.query}")
+            print(f"Fetching 10 papers for query: {self.query}")
 
-        response = requests.get(self.BASE_URL, params=search_params)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch papers: {response.status_code}")
+        # Retry logic for API requests
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(self.BASE_URL, params=search_params, timeout=60)
+                response.raise_for_status()  # Raise an error for bad status codes
 
-        paper_ids = response.json().get("esearchresult", {}).get("idlist", [])
+                # Parse JSON response
+                data = response.json()
+                paper_ids = data.get("esearchresult", {}).get("idlist", [])
+                break  # Exit the retry loop if the request succeeds
+            except (requests.exceptions.RequestException, ValueError) as e:
+                #if self.debug:
+                  #  print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    if self.debug:
+                        print("Max retries reached. Failed to fetch papers.")
+                    return []
+                time.sleep(5)  # Wait 5 seconds before retrying
+
         if self.debug:
             print(f"Found {len(paper_ids)} papers.")
 
         papers = []
-        for paper_id in paper_ids:
-            paper_details = self._fetch_paper_details(paper_id)
-            if paper_details:
-                papers.append(paper_details)
+        if paper_ids:  # Process the first 5 papers
+            for idx, paper_id in enumerate(paper_ids[:10]):  # Process up to 5 papers
+                if self.debug:
+                    print(f"Processing paper {idx + 1}/{len(paper_ids)}...")
+                paper_details = self._fetch_paper_details(paper_id)
+                if paper_details:
+                    papers.append(paper_details)
 
         return papers
 
@@ -46,14 +66,27 @@ class PubMedFetcher:
             "id": paper_id,
             "retmode": "xml",
         }
-        response = requests.get(self.FETCH_URL, params=fetch_params)
-        if response.status_code != 200:
-            return None
+        # Retry logic for API requests
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(self.FETCH_URL, params=fetch_params, timeout=60)
+                response.raise_for_status()  # Raise an error for bad status codes
 
-        # Parse XML response (simplified for brevity)
+                break  # Exit the retry loop if the request succeeds
+            except requests.exceptions.RequestException as e:
+                if self.debug:
+                    print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    if self.debug:
+                        print("Max retries reached. Failed to fetch paper details.")
+                    return None
+                time.sleep(5)  # Wait 5 seconds before retrying
+
+        # Parse XML response using lxml
         paper_xml = response.text
         title = self._extract_from_xml(paper_xml, "ArticleTitle")
-        pub_date = self._extract_from_xml(paper_xml, "PubDate")
+        pub_date = self._extract_pub_date(paper_xml)  # Extract publication date
         authors = self._extract_authors(paper_xml)
         email = self._extract_from_xml(paper_xml, "Email")
 
@@ -72,62 +105,72 @@ class PubMedFetcher:
         return None
 
     def _extract_from_xml(self, xml: str, tag: str) -> str:
-        """Extract text from an XML tag (simplified)."""
-        start_tag = f"<{tag}>"
-        end_tag = f"</{tag}>"
-        start = xml.find(start_tag)
-        end = xml.find(end_tag)
-        if start != -1 and end != -1:
-            return xml[start + len(start_tag) : end].strip()
+        """Extract text from an XML tag using lxml."""
+        try:
+            root = etree.fromstring(xml.encode("utf-8"))
+            element = root.find(f".//{tag}")
+            if element is not None and element.text is not None:
+                return element.text.strip()
+        except Exception as e:
+            if self.debug:
+                print(f"Error extracting {tag} from XML: {e}")
+        return ""
+
+    def _extract_pub_date(self, xml: str) -> str:
+        """Extract publication date from XML."""
+        try:
+            root = etree.fromstring(xml.encode("utf-8"))
+            pub_date = root.find(".//PubDate")
+            if pub_date is not None:
+                year = pub_date.findtext("Year", "").strip()
+                month = pub_date.findtext("Month", "").strip()
+                day = pub_date.findtext("Day", "").strip()
+                return f"{year}-{month}-{day}" if year and month and day else ""
+        except Exception as e:
+            if self.debug:
+                print(f"Error extracting publication date from XML: {e}")
         return ""
 
     def _extract_authors(self, xml: str) -> List[Dict]:
-        """Extract authors and their affiliations from XML."""
-        # Simplified extraction; use an XML parser for robust parsing.
+        """Extract authors and their affiliations from XML using lxml."""
         authors = []
-        author_blocks = xml.split("<Author>")
-        for block in author_blocks[1:]:
-            name = self._extract_from_xml(block, "LastName")
-            affiliation = self._extract_from_xml(block, "Affiliation")
-            if name and affiliation:
-                authors.append({"name": name, "affiliation": affiliation})
+        try:
+            root = etree.fromstring(xml.encode("utf-8"))
+            for author in root.xpath("//Author"):
+                last_name = author.findtext("LastName", "").strip()
+                fore_name = author.findtext("ForeName", "").strip()
+                affiliation = author.findtext("Affiliation", "").strip()
+                if last_name:  # Only include authors with a last name
+                    authors.append({
+                        "name": f"{fore_name} {last_name}",
+                        "affiliation": affiliation
+                    })
+        except Exception as e:
+            if self.debug:
+                print(f"Error parsing XML for authors: {e}")
         return authors
 
     def _filter_authors(self, authors: List[Dict]) -> (List[str], List[str]):
         """Filter authors with pharmaceutical or biotech affiliations."""
         company_authors = []
         company_affiliations = []
+        keywords = ["pharma", "biotech", "pharmaceutical", "biotechnology"]  # Keywords to filter affiliations
+
         for author in authors:
             affiliation = author.get("affiliation", "").lower()
-            if self.debug:
-                print(f"Author: {author['name']}, Affiliation: {affiliation}")  # Debug print
-            # Check if the affiliation contains any company-related keywords
-            if (
-                "pharma" in affiliation
-                or "biotech" in affiliation
-                or "inc" in affiliation
-                or "corp" in affiliation
-                or "ltd" in affiliation
-                or "company" in affiliation
-                or "research" in affiliation  # Add more keywords if needed
-                or "drug" in affiliation
-                or "medicine" in affiliation
-                or "healthcare" in affiliation
-                or "clinical" in affiliation
-                or "therapy" in affiliation
-                or "pharmaceutical" in affiliation  # Added
-                or "biotechnology" in affiliation  # Added
-                or "medical" in affiliation  # Added
-                or "center" in affiliation  # Added
-                or "institute" in affiliation  # Added
-                or "foundation" in affiliation  # Added
-                or "hospital" in affiliation  # Added
-                or "clinic" in affiliation  # Added
-                or "group" in affiliation  # Added
-                or "organization" in affiliation  # Added
-            ):
+            if any(keyword in affiliation for keyword in keywords):
                 company_authors.append(author["name"])
                 company_affiliations.append(author["affiliation"])
+
+        # If no company authors found, return all authors regardless of affiliation
+        if not company_authors:
+            company_authors = [author["name"] for author in authors]
+            company_affiliations = [author["affiliation"] for author in authors]
+
+        #if self.debug:
+         #   print(f"Filtered authors: {company_authors}")
+          #  print(f"Filtered affiliations: {company_affiliations}")
+
         return company_authors, company_affiliations
 
     def save_to_csv(self, papers: List[Dict], filename: str = None):
@@ -136,13 +179,19 @@ class PubMedFetcher:
             print("No papers found.")
             return
 
+        #if self.debug:
+         #   print(f"Papers to save: {papers}")  # Debug print
+
         if filename:
-            with open(filename, "w", newline="", encoding="utf-8") as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=papers[0].keys())
-                writer.writeheader()
-                writer.writerows(papers)
-            if self.debug:
-                print(f"Results saved to {filename}.")
+            try:
+                with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=papers[0].keys())
+                    writer.writeheader()
+                    writer.writerows(papers)
+                if self.debug:
+                    print(f"Results saved to {filename}.")
+            except Exception as e:
+                print(f"Error saving to CSV: {e}")
         else:
             for paper in papers:
                 print(paper)
